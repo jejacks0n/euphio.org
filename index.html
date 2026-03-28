@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+
+  <title>Euphio · The Euphio Question · TEQ</title>
+  <meta name="description" content="Euphio · The Euphio Question · TEQ">
+
+  <meta property="og:site_name" content="euphio.org">
+  <meta property="og:title" content="Euphio">
+  <meta property="og:description" content="Euphio · The Euphio Question · TEQ">
+  <meta property="og:image" content="https://euphio.org/og-image.png">
+  <meta property="og:url" content="https://euphio.org">
+  <meta property="og:type" content="website">
+
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Euphio">
+  <meta name="twitter:description" content="Euphio · The Euphio Question · TEQ">
+  <meta name="twitter:image" content="https://euphio.org/og-image.png">
+  <style>
+    @font-face {
+      font-family: 'IBM VGA 8x16';
+      font-style: normal;
+      font-weight: 400;
+      src: url('web_ibm_vga_8x16.woff') format('woff');
+    }
+
+    html, body {
+      background-color: #000;
+    }
+
+    @keyframes scanline-flicker {
+      0% { opacity: 0.8; }
+      100% { opacity: 1; }
+    }
+
+    canvas {
+      position: relative;
+    }
+
+    canvas::after {
+      position: absolute;
+      content: "";
+      inset: 0;
+      z-index: 5;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        0deg,
+        transparent 0px,
+        transparent 2px,
+        rgba(0, 0, 0, 0.15) 2px,
+        rgba(0, 0, 0, 0.15) 4px
+      );
+      animation: scanline-flicker 0.1s steps(2) infinite;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+  <canvas></canvas>
+  <script>
+    const canvas = document.querySelector('canvas');
+    const ctx = canvas.getContext('2d');
+    const CHAR_W = 8, CHAR_H = 16;
+    const CHARS_PER_FRAME = 8;
+    const NOISE_FRAMES = 1;
+    const NOISE_CHARS = '░▒▓▄▀▌▐█ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&';
+
+    // Offscreen buffer — streaming writes here, effects read from here
+    const buf = document.createElement('canvas');
+    const bufCtx = buf.getContext('2d');
+
+    function drawNoise(x, y) {
+      const ch = NOISE_CHARS[Math.random() * NOISE_CHARS.length | 0];
+      bufCtx.fillStyle = '#000';
+      bufCtx.fillRect(x, y, CHAR_W, CHAR_H);
+      bufCtx.fillStyle = `hsl(${Math.random() * 360 | 0}, 60%, 70%)`;
+      bufCtx.fillText(ch, x, y);
+    }
+
+    function buildVignette(w, h) {
+      const vc = document.createElement('canvas');
+      vc.width = w; vc.height = h;
+      const c = vc.getContext('2d');
+      const g = c.createRadialGradient(w/2, h/2, h*0.1, w/2, h/2, Math.max(w,h)*0.75);
+      g.addColorStop(0, 'rgba(0,0,0,0)');
+      g.addColorStop(1, 'rgba(0,0,0,0.85)');
+      c.fillStyle = g;
+      c.fillRect(0, 0, w, h);
+      return vc;
+    }
+
+    function applyEffects(w, h, vignette, time) {
+      const src = bufCtx.getImageData(0, 0, w, h).data;
+      const out = ctx.createImageData(w, h);
+      const dst = out.data;
+
+      const curve = 0.015; // barrel distortion strength
+      const ca    = 2;     // chromatic aberration in pixels
+
+      for (let y = 0; y < h; y++) {
+        const ny     = (y / h - 0.5) * 2;
+        const xInset = curve * ny * ny;
+
+        for (let x = 0; x < w; x++) {
+          const t  = (x / w - xInset) / (1 - 2 * xInset);
+          const sx = Math.round(t * w);
+          const i  = (y * w + x) * 4;
+
+          if (sx < 0 || sx >= w) { dst[i+3] = 255; continue; }
+
+          const ri = (y * w + Math.max(0, sx - ca)) * 4;
+          const gi = (y * w + sx) * 4;
+          const bi = (y * w + Math.min(w - 1, sx + ca)) * 4;
+
+          dst[i]   = src[ri];
+          dst[i+1] = src[gi+1];
+          dst[i+2] = src[bi+2];
+          dst[i+3] = 255;
+        }
+      }
+
+      ctx.putImageData(out, 0, 0);
+      ctx.drawImage(vignette, 0, 0);
+    }
+
+    const img = new Image();
+    img.onload = () => {
+      buf.width = canvas.width = img.width;
+      buf.height = canvas.height = img.height;
+
+      bufCtx.drawImage(img, 0, 0);
+      const imageData = bufCtx.getImageData(0, 0, img.width, img.height);
+
+      bufCtx.fillStyle = '#000';
+      bufCtx.fillRect(0, 0, img.width, img.height);
+      bufCtx.font = '16px "IBM VGA 8x16"';
+      bufCtx.textBaseline = 'top';
+
+      const vignette = buildVignette(img.width, img.height);
+      const cols = Math.ceil(img.width / CHAR_W);
+      const rows = Math.ceil(img.height / CHAR_H);
+      let cell = 0;
+      const total = cols * rows;
+      const pending = [];
+
+      document.body.style.overflow = 'hidden';
+
+      function scrollToCursor() {
+        const scale = canvas.offsetWidth / canvas.width;
+        const row = Math.floor(cell / cols);
+        const cssY = canvas.offsetTop + row * CHAR_H * scale;
+        window.scrollTo({ top: cssY - window.innerHeight + CHAR_H * scale, behavior: 'instant' });
+      }
+
+      let lastRow = -1;
+      function frame(time) {
+        // Streaming tick
+        for (let i = pending.length - 1; i >= 0; i--) {
+          const p = pending[i];
+          if (--p.frames <= 0) {
+            bufCtx.putImageData(imageData, 0, 0, p.x, p.y, CHAR_W, CHAR_H);
+            pending.splice(i, 1);
+          } else {
+            drawNoise(p.x, p.y);
+          }
+        }
+        for (let i = 0; i < CHARS_PER_FRAME && cell < total; i++, cell++) {
+          const x = (cell % cols) * CHAR_W;
+          const y = Math.floor(cell / cols) * CHAR_H;
+          pending.push({ x, y, frames: NOISE_FRAMES });
+          drawNoise(x, y);
+        }
+
+        const row = Math.floor(cell / cols);
+        if (row !== lastRow) { scrollToCursor(); lastRow = row; }
+        if (cell >= total && pending.length === 0) document.body.style.overflow = '';
+
+        applyEffects(img.width, img.height, vignette, time);
+        requestAnimationFrame(frame);
+      }
+
+      requestAnimationFrame(frame);
+    };
+
+    document.fonts.load('16px "IBM VGA 8x16"').then(() => { img.src = 'teq.png'; });
+  </script>
+</body>
+</html>
