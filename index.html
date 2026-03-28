@@ -33,15 +33,15 @@
     }
 
     @keyframes scanline-flicker {
-      0% { opacity: 0.8; }
+      0% { opacity: 0.6; }
       100% { opacity: 1; }
     }
 
-    canvas {
+    main {
       position: relative;
     }
 
-    canvas::after {
+    main::after {
       position: absolute;
       content: "";
       inset: 0;
@@ -51,8 +51,8 @@
         0deg,
         transparent 0px,
         transparent 2px,
-        rgba(0, 0, 0, 0.15) 2px,
-        rgba(0, 0, 0, 0.15) 4px
+        rgba(0, 0, 0, 0.05) 2px,
+        rgba(0, 0, 0, 0.05) 4px
       );
       animation: scanline-flicker 0.1s steps(2) infinite;
     }
@@ -66,7 +66,7 @@
   </style>
 </head>
 <body>
-  <canvas></canvas>
+  <main><canvas></canvas></main>
   <script>
     const canvas = document.querySelector('canvas');
     const ctx = canvas.getContext('2d');
