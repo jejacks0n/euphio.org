@@ -37,16 +37,27 @@
       100% { opacity: 1; }
     }
 
-    main {
-      position: relative;
+    canvas {
+      display: block;
+      width: 100%;
+      height: auto;
     }
 
-    main::after {
-      position: absolute;
-      content: "";
+    .crt-overlay {
+      position: fixed;
       inset: 0;
-      z-index: 5;
       pointer-events: none;
+      z-index: 100;
+      border-radius: 4% / 3%;
+      overflow: hidden;
+      background: radial-gradient(ellipse at center, transparent 45%, rgba(0, 0, 0, 0.8) 100%);
+      box-shadow: 0 0 0 100vmax #000, inset 0 0 80px rgba(0, 0, 0, 0.4);
+    }
+
+    .crt-overlay::before {
+      content: "";
+      position: absolute;
+      inset: 0;
       background: repeating-linear-gradient(
         0deg,
         transparent 0px,
@@ -56,26 +67,19 @@
       );
       animation: scanline-flicker 0.1s steps(2) infinite;
     }
-
-    canvas {
-      display: block;
-      width: 100%;
-      height: auto;
-      image-rendering: pixelated;
-    }
   </style>
 </head>
 <body>
   <main><canvas></canvas></main>
+  <div class="crt-overlay"></div>
   <script>
     const canvas = document.querySelector('canvas');
-    const ctx = canvas.getContext('2d');
     const CHAR_W = 8, CHAR_H = 16;
     const CHARS_PER_FRAME = 8;
     const NOISE_FRAMES = 1;
     const NOISE_CHARS = '░▒▓▄▀▌▐█ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789@#$%&';
 
-    // Offscreen buffer — streaming writes here, effects read from here
+    // Offscreen buffer — all content rendered here; WebGL reads it as a texture
     const buf = document.createElement('canvas');
     const bufCtx = buf.getContext('2d');
 
@@ -87,56 +91,105 @@
       bufCtx.fillText(ch, x, y);
     }
 
-    function buildVignette(w, h) {
-      const vc = document.createElement('canvas');
-      vc.width = w; vc.height = h;
-      const c = vc.getContext('2d');
-      const g = c.createRadialGradient(w/2, h/2, h*0.1, w/2, h/2, Math.max(w,h)*0.75);
-      g.addColorStop(0, 'rgba(0,0,0,0)');
-      g.addColorStop(1, 'rgba(0,0,0,0.85)');
-      c.fillStyle = g;
-      c.fillRect(0, 0, w, h);
-      return vc;
+    // WebGL canvas — position: fixed, covers the viewport, renders buf with effects
+    const glCanvas = document.createElement('canvas');
+    glCanvas.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:50;';
+    document.body.appendChild(glCanvas);
+    const gl = glCanvas.getContext('webgl');
+
+    function resizeGL() {
+      glCanvas.width  = window.innerWidth  * devicePixelRatio;
+      glCanvas.height = window.innerHeight * devicePixelRatio;
+      gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+    }
+    window.addEventListener('resize', resizeGL);
+    resizeGL();
+
+    const vs = `
+      attribute vec2 a_pos;
+      varying vec2 v_uv;
+      void main() {
+        gl_Position = vec4(a_pos, 0.0, 1.0);
+        v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
+      }
+    `;
+
+    // Barrel distortion + chromatic aberration, scoped to the visible viewport slice
+    const fs = `
+      precision mediump float;
+      uniform sampler2D u_tex;
+      uniform float u_visY;
+      uniform float u_visH;
+      uniform float u_caX;
+      varying vec2 v_uv;
+
+      void main() {
+        vec2 c = v_uv * 2.0 - 1.0;
+        float r2 = dot(c, c);
+        vec2 warpedUV = (c * (1.0 + 0.015 * r2)) * 0.5 + 0.5;
+
+        if (warpedUV.x < 0.0 || warpedUV.x > 1.0 || warpedUV.y < 0.0 || warpedUV.y > 1.0) {
+          gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+          return;
+        }
+
+        vec2 texUV = vec2(warpedUV.x, u_visY + warpedUV.y * u_visH);
+        float r = texture2D(u_tex, texUV + vec2(-u_caX, 0.0)).r;
+        float g = texture2D(u_tex, texUV).g;
+        float b = texture2D(u_tex, texUV + vec2( u_caX, 0.0)).b;
+        gl_FragColor = vec4(r, g, b, 1.0);
+      }
+    `;
+
+    function compileShader(type, src) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      return sh;
     }
 
-    function applyEffects(w, h, vignette, time) {
-      const src = bufCtx.getImageData(0, 0, w, h).data;
-      const out = ctx.createImageData(w, h);
-      const dst = out.data;
+    const prog = gl.createProgram();
+    gl.attachShader(prog, compileShader(gl.VERTEX_SHADER, vs));
+    gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, fs));
+    gl.linkProgram(prog);
+    gl.useProgram(prog);
 
-      const curve = 0.015; // barrel distortion strength
-      const ca    = 2;     // chromatic aberration in pixels
+    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'a_pos');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
 
-      for (let y = 0; y < h; y++) {
-        const ny     = (y / h - 0.5) * 2;
-        const xInset = curve * ny * ny;
+    const tex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.uniform1i(gl.getUniformLocation(prog, 'u_tex'), 0);
 
-        for (let x = 0; x < w; x++) {
-          const t  = (x / w - xInset) / (1 - 2 * xInset);
-          const sx = Math.round(t * w);
-          const i  = (y * w + x) * 4;
+    const uVisY = gl.getUniformLocation(prog, 'u_visY');
+    const uVisH = gl.getUniformLocation(prog, 'u_visH');
+    const uCaX  = gl.getUniformLocation(prog, 'u_caX');
 
-          if (sx < 0 || sx >= w) { dst[i+3] = 255; continue; }
-
-          const ri = (y * w + Math.max(0, sx - ca)) * 4;
-          const gi = (y * w + sx) * 4;
-          const bi = (y * w + Math.min(w - 1, sx + ca)) * 4;
-
-          dst[i]   = src[ri];
-          dst[i+1] = src[gi+1];
-          dst[i+2] = src[bi+2];
-          dst[i+3] = 255;
-        }
-      }
-
-      ctx.putImageData(out, 0, 0);
-      ctx.drawImage(vignette, 0, 0);
+    function renderGL() {
+      if (!buf.width || !buf.height) return;
+      const rect  = canvas.getBoundingClientRect();
+      const scale = rect.width / canvas.width;
+      const visY  = Math.max(0, -rect.top) / scale;
+      const visH  = Math.max(0, Math.min(canvas.height, (window.innerHeight - rect.top) / scale) - visY);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, buf);
+      gl.uniform1f(uVisY, visY / canvas.height);
+      gl.uniform1f(uVisH, visH / canvas.height);
+      gl.uniform1f(uCaX,  2.0  / canvas.width);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
 
     const img = new Image();
     img.onload = () => {
       buf.width = canvas.width = img.width;
       buf.height = canvas.height = img.height;
+      canvas.style.visibility = 'hidden'; // layout placeholder only; WebGL canvas displays content
 
       bufCtx.drawImage(img, 0, 0);
       const imageData = bufCtx.getImageData(0, 0, img.width, img.height);
@@ -146,7 +199,6 @@
       bufCtx.font = '16px "IBM VGA 8x16"';
       bufCtx.textBaseline = 'top';
 
-      const vignette = buildVignette(img.width, img.height);
       const cols = Math.ceil(img.width / CHAR_W);
       const rows = Math.ceil(img.height / CHAR_H);
       let cell = 0;
@@ -163,8 +215,7 @@
       }
 
       let lastRow = -1;
-      function frame(time) {
-        // Streaming tick
+      function frame() {
         for (let i = pending.length - 1; i >= 0; i--) {
           const p = pending[i];
           if (--p.frames <= 0) {
@@ -185,7 +236,7 @@
         if (row !== lastRow) { scrollToCursor(); lastRow = row; }
         if (cell >= total && pending.length === 0) document.body.style.overflow = '';
 
-        applyEffects(img.width, img.height, vignette, time);
+        renderGL();
         requestAnimationFrame(frame);
       }
 
