@@ -29,6 +29,7 @@
     }
 
     html, body {
+      margin: 0;
       background-color: #000;
     }
 
@@ -174,13 +175,12 @@
 
     function renderGL() {
       if (!buf.width || !buf.height) return;
-      const rect  = canvas.getBoundingClientRect();
-      const scale = rect.width / canvas.width;
-      const visY  = Math.max(0, -rect.top) / scale;
-      const visH  = Math.max(0, Math.min(canvas.height, (window.innerHeight - rect.top) / scale) - visY);
+      const scale = canvas.offsetWidth / canvas.width;
+      const visY  = window.scrollY / scale;
+      const visH  = Math.min(canvas.height - visY, window.innerHeight / scale);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, buf);
       gl.uniform1f(uVisY, visY / canvas.height);
-      gl.uniform1f(uVisH, visH / canvas.height);
+      gl.uniform1f(uVisH, Math.max(0, visH) / canvas.height);
       gl.uniform1f(uCaX,  2.0  / canvas.width);
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     }
