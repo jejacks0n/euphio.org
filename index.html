@@ -176,7 +176,7 @@
     function renderGL() {
       if (!buf.width || !buf.height) return;
       const scale = canvas.offsetWidth / canvas.width;
-      const visY  = window.scrollY / scale;
+      const visY  = Math.max(0, window.scrollY) / scale;
       const visH  = Math.min(canvas.height - visY, window.innerHeight / scale);
       gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, buf);
       gl.uniform1f(uVisY, visY / canvas.height);
