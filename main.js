@@ -4,8 +4,8 @@ const BLOOM  = 3.5;
 const GLARE  = 0.45;
 const PHI    = (1 + Math.sqrt(5)) / 2; // golden ratio ≈ 1.618 → 1/PHI ≈ 0.618 → 1 - 1/PHI ≈ 0.382
 const CHAR_W = 8, CHAR_H = 16;
-const CHARS_PER_FRAME = 8;
-const NOISE_FRAMES = 1;
+const CHARS_PER_SEC = 480; // characters revealed per second during load
+const NOISE_MS      = 32;  // ms each cell shows noise before resolving
 const NOISE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
 // Offscreen buffer — all content rendered here; WebGL reads it as a texture
@@ -210,21 +210,27 @@ img.onload = () => {
     window.scrollTo({ top: cssY - window.innerHeight + CHAR_H * scale, behavior: 'instant' });
   }
 
-  let lastRow = -1;
-  function frame() {
+  let lastRow = -1, lastTs = null;
+  function frame(ts) {
+    if (lastTs === null) lastTs = ts;
+    const dt = ts - lastTs;
+    lastTs = ts;
+
     for (let i = pending.length - 1; i >= 0; i--) {
       const p = pending[i];
-      if (--p.frames <= 0) {
+      p.ms -= dt;
+      if (p.ms <= 0) {
         bufCtx.putImageData(imageData, 0, 0, p.x, p.y, CHAR_W, CHAR_H);
         pending.splice(i, 1);
       } else {
         drawNoise(p.x, p.y);
       }
     }
-    for (let i = 0; i < CHARS_PER_FRAME && cell < total; i++, cell++) {
+    const charsThisFrame = Math.round(CHARS_PER_SEC * dt / 1000);
+    for (let i = 0; i < charsThisFrame && cell < total; i++, cell++) {
       const x = (cell % cols) * CHAR_W;
       const y = Math.floor(cell / cols) * CHAR_H;
-      pending.push({ x, y, frames: NOISE_FRAMES });
+      pending.push({ x, y, ms: NOISE_MS });
       drawNoise(x, y);
     }
 
@@ -235,7 +241,7 @@ img.onload = () => {
       startViz();
     }
 
-    drawViz();
+    drawViz(ts);
     renderGL();
     requestAnimationFrame(frame);
   }
@@ -247,13 +253,13 @@ img.onload = () => {
 const MARQUEE_TEXT   = '  THE · EUPHIO · QUESTION · 2.0  ';
 const MARQUEE_COLS   = 28; // width in characters
 const MARQUEE_LEFT   = 26; // characters from left edge of image
-const MARQUEE_SPEED  = 8;  // frames per character step — higher is slower
+const MARQUEE_SPEED  = 133; // ms per character step
 const MARQUEE_BOTTOM = 16 * 9; // pixels from bottom of image
 const MARQUEE_W      = MARQUEE_COLS * CHAR_W;
 const MARQUEE_H      = CHAR_H;
 
 let vizStarted = false;
-let analyser, freqData, marqueeX, marqueeFrame = 0, bloomValue = BLOOM;
+let analyser, freqData, marqueeX, marqueeLastStep = 0, bloomValue = BLOOM;
 
 function startViz() {
   vizStarted = true;
@@ -272,18 +278,17 @@ function startViz() {
   // });
 }
 
-function drawViz() {
+function drawViz(ts) {
   if (!vizStarted) return;
 
   const marqX = MARQUEE_LEFT * CHAR_W;
   const marqY = buf.height - MARQUEE_H - MARQUEE_BOTTOM;
 
-  // Marquee — steps one character width per frame for ANSI terminal feel
-  if (marqueeX === null) marqueeX = marqX + MARQUEE_W;
-  marqueeFrame++;
-  if (marqueeFrame >= MARQUEE_SPEED) {
+  // Marquee — steps one character width per MARQUEE_SPEED ms for consistent timing
+  if (marqueeX === null) { marqueeX = marqX + MARQUEE_W; marqueeLastStep = ts; }
+  while (ts - marqueeLastStep >= MARQUEE_SPEED) {
     marqueeX -= CHAR_W;
-    marqueeFrame = 0;
+    marqueeLastStep += MARQUEE_SPEED;
   }
   if (marqueeX < marqX - MARQUEE_TEXT.length * CHAR_W) marqueeX = marqX + MARQUEE_W;
   bufCtx.fillStyle = '#000';
