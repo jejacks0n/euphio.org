@@ -6,7 +6,7 @@ const PHI    = (1 + Math.sqrt(5)) / 2; // golden ratio ≈ 1.618 → 1/PHI ≈ 0
 const CHAR_W = 8, CHAR_H = 16;
 const CHARS_PER_SEC = 480; // characters revealed per second during load
 const NOISE_MS      = 32;  // ms each cell shows noise before resolving
-const NOISE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+const NOISE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ~!@#$%^&*()[]|\\/<>:;{}+=';
 
 // Offscreen buffer — all content rendered here; WebGL reads it as a texture
 const buf = document.createElement('canvas');
@@ -178,7 +178,7 @@ function drawNoise(x, y) {
   bufCtx.fillStyle = '#000';
   bufCtx.fillRect(x, y, CHAR_W, CHAR_H);
   bufCtx.fillStyle = `hsl(${Math.random() * 360 | 0}, 60%, 70%)`;
-  bufCtx.fillText(ch, x + 1, y);
+  bufCtx.fillText(ch, x + 1, y + 1);
 }
 
 const img = new Image();
