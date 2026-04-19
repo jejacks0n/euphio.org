@@ -20,6 +20,7 @@
   <meta name="twitter:title" content="Euphio">
   <meta name="twitter:description" content="Euphio · The Euphio Question · TEQ">
   <meta name="twitter:image" content="https://euphio.org/og-image.png">
+
   <style>
     @font-face {
       font-family: 'IBM VGA 8x16';
@@ -34,19 +35,15 @@
       overscroll-behavior: none;
     }
 
-    @keyframes scanline-flicker {
-      0% { opacity: 0.2; }
-      100% { opacity: 0.3; }
-    }
-
     canvas {
       display: block;
       width: 100%;
       height: auto;
     }
 
-    .crt-overlay {
+    main:after {
       position: fixed;
+      content: "";
       inset: 0;
       pointer-events: none;
       z-index: 100;
@@ -55,276 +52,10 @@
       background: radial-gradient(ellipse at center, transparent 45%, rgba(0, 0, 0, 0.8) 100%);
       box-shadow: 0 0 0 100vmax #000, inset 0 0 80px rgba(0, 0, 0, 0.4);
     }
-
-    .crt-overlay::before {
-      content: "";
-      position: absolute;
-      inset: 0;
-      background: repeating-linear-gradient(
-        0deg,
-        transparent 0px,
-        transparent 2px,
-        rgba(0, 0, 0, 0.25) 2px,
-        rgba(0, 0, 0, 0.25) 4px
-      );
-      animation: scanline-flicker 0.1s steps(2) infinite;
-    }
-
   </style>
 </head>
 <body>
   <main><canvas></canvas></main>
-  <div class="crt-overlay"></div>
-  <script>
-    // Block pinch-to-zoom gestures
-    document.addEventListener('gesturestart', function(e) {
-      e.preventDefault();
-    }, { passive: false });
-
-    const canvas = document.querySelector('canvas');
-    const BARREL = 0.03;
-    const BLOOM  = 3.5;
-    const GLARE  = 0.25;
-    const PHI    = (1 + Math.sqrt(5)) / 2; // golden ratio ≈ 1.618 → 1/PHI ≈ 0.618 → 1 - 1/PHI ≈ 0.382
-    const CHAR_W = 8, CHAR_H = 16;
-    const CHARS_PER_FRAME = 8;
-    const NOISE_FRAMES = 1;
-    const NOISE_CHARS = 'ABCDEFGHIJKLMNOPRSTUVWXYZ0123456789';
-
-    // Offscreen buffer — all content rendered here; WebGL reads it as a texture
-    const buf = document.createElement('canvas');
-    const bufCtx = buf.getContext('2d');
-
-    function drawNoise(x, y) {
-      const ch = NOISE_CHARS[Math.random() * NOISE_CHARS.length | 0];
-      bufCtx.fillStyle = '#000';
-      bufCtx.fillRect(x, y, CHAR_W, CHAR_H);
-      bufCtx.fillStyle = `hsl(${Math.random() * 360 | 0}, 60%, 70%)`;
-      bufCtx.fillText(ch, x, y);
-    }
-
-    // WebGL canvas — position: fixed, covers the viewport, renders buf with effects
-    const glCanvas = document.createElement('canvas');
-    glCanvas.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:50;';
-    document.body.appendChild(glCanvas);
-    const gl = glCanvas.getContext('webgl');
-
-    function resizeGL() {
-      glCanvas.width  = window.innerWidth  * devicePixelRatio;
-      glCanvas.height = window.innerHeight * devicePixelRatio;
-      gl.viewport(0, 0, glCanvas.width, glCanvas.height);
-    }
-    window.addEventListener('resize', resizeGL);
-    resizeGL();
-
-    const vs = `
-      attribute vec2 a_pos;
-      varying vec2 v_uv;
-      void main() {
-        gl_Position = vec4(a_pos, 0.0, 1.0);
-        v_uv = vec2(a_pos.x * 0.5 + 0.5, 0.5 - a_pos.y * 0.5);
-      }
-    `;
-
-    const fs = `
-      precision mediump float;
-      uniform sampler2D u_tex;
-      uniform float u_visY;
-      uniform float u_visH;
-      uniform float u_caX;
-      uniform float u_caY;
-      uniform float u_barrel;
-      uniform float u_glare;
-      uniform float u_glareX;
-      uniform float u_fx;
-      uniform float u_bloom;
-      varying vec2 v_uv;
-
-      vec3 brightPass(vec3 c) {
-        float lum = dot(c, vec3(0.299, 0.587, 0.114));
-        float knee = 0.1;
-        float threshold = 0.65;
-        float excess = clamp((lum - threshold + knee) / (2.0 * knee), 0.0, 1.0);
-        excess = mix(0.0, lum - threshold, excess);
-        return c * (max(0.0, excess) / max(lum, 0.001));
-      }
-
-      void main() {
-        if (u_fx < 0.5) {
-          vec2 rawUV = vec2(v_uv.x, u_visY + v_uv.y * u_visH);
-          gl_FragColor = texture2D(u_tex, rawUV);
-          return;
-        }
-
-        vec2 c = v_uv * 2.0 - 1.0;
-        float r2 = dot(c, c);
-        vec2 warpedUV = (c * (1.0 + u_barrel * r2)) * 0.5 + 0.5;
-
-        if (warpedUV.x < 0.0 || warpedUV.x > 1.0 || warpedUV.y < 0.0 || warpedUV.y > 1.0) {
-          gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
-          return;
-        }
-
-        vec2 texUV = vec2(warpedUV.x, u_visY + warpedUV.y * u_visH);
-
-        // Chromatic aberration — red/blue channels offset horizontally by one texel
-        float r = texture2D(u_tex, texUV + vec2(-u_caX, 0.0)).r;
-        float g = texture2D(u_tex, texUV).g;
-        float b = texture2D(u_tex, texUV + vec2( u_caX, 0.0)).b;
-        vec3 rgb = vec3(r, g, b);
-
-        // CRT phosphor glow / bloom — wide multi-ring kernel, bright-pass per sample
-        vec2 px = vec2(u_caX, u_caY);
-        vec3 bloom = vec3(0.0);
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 2.0,  0.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2(-2.0,  0.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 0.0,  2.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 0.0, -2.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 1.0,  1.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2(-1.0,  1.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 1.0, -1.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2(-1.0, -1.0) * px).rgb) * 1.0;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 8.0,  0.0) * px).rgb) * 0.3;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2(-8.0,  0.0) * px).rgb) * 0.3;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 0.0,  8.0) * px).rgb) * 0.3;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 0.0, -8.0) * px).rgb) * 0.3;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 5.0,  5.0) * px).rgb) * 0.3;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2(-5.0,  5.0) * px).rgb) * 0.3;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2( 5.0, -5.0) * px).rgb) * 0.3;
-        bloom += brightPass(texture2D(u_tex, texUV + vec2(-5.0, -5.0) * px).rgb) * 0.3;
-        bloom /= 18.8;
-        rgb = min(vec3(1.0), rgb + bloom * u_bloom);
-
-        // CRT glass reflection — rendered in warped UV space so it follows the curve
-        float cx = (warpedUV.x - u_glareX) * 2.0;
-        float reflH = 1.0 - smoothstep(0.0, 0.22, warpedUV.y);
-        float reflW = max(0.0, 1.0 - cx * cx);
-        float specH = 1.0 - smoothstep(0.0, 0.07, warpedUV.y);
-        float specW = 1.0 - smoothstep(0.0, 0.28, abs(cx));
-        float refl  = reflH * reflW * reflW * u_glare + specH * specW * u_glare * 0.75;
-        rgb = min(vec3(1.0), rgb + vec3(0.7, 0.86, 1.0) * refl);
-
-        gl_FragColor = vec4(rgb, 1.0);
-      }
-    `;
-
-    function compileShader(type, src) {
-      const sh = gl.createShader(type);
-      gl.shaderSource(sh, src);
-      gl.compileShader(sh);
-      return sh;
-    }
-
-    const prog = gl.createProgram();
-    gl.attachShader(prog, compileShader(gl.VERTEX_SHADER, vs));
-    gl.attachShader(prog, compileShader(gl.FRAGMENT_SHADER, fs));
-    gl.linkProgram(prog);
-    gl.useProgram(prog);
-
-    gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
-    const aPos = gl.getAttribLocation(prog, 'a_pos');
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
-
-    const tex = gl.createTexture();
-    gl.bindTexture(gl.TEXTURE_2D, tex);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.uniform1i(gl.getUniformLocation(prog, 'u_tex'), 0);
-
-    const uVisY = gl.getUniformLocation(prog, 'u_visY');
-    const uVisH = gl.getUniformLocation(prog, 'u_visH');
-    const uCaX    = gl.getUniformLocation(prog, 'u_caX');
-    const uCaY    = gl.getUniformLocation(prog, 'u_caY');
-    const uBarrel = gl.getUniformLocation(prog, 'u_barrel');
-    const uGlare  = gl.getUniformLocation(prog, 'u_glare');
-    const uGlareX = gl.getUniformLocation(prog, 'u_glareX');
-    const uFx     = gl.getUniformLocation(prog, 'u_fx');
-    const uBloom  = gl.getUniformLocation(prog, 'u_bloom');
-    gl.uniform1f(uGlare,  GLARE);
-    gl.uniform1f(uBloom,  BLOOM);
-    gl.uniform1f(uGlareX, 1.0 - 1.0 / PHI); // 1 - 1/φ ≈ 0.382 — left of center
-
-    let fxEnabled = true;
-    window.addEventListener('keydown', (e) => { if (e.key === '2') fxEnabled = !fxEnabled; });
-
-    function renderGL() {
-      if (!buf.width || !buf.height) return;
-      const scale = canvas.offsetWidth / canvas.width;
-      const visY  = Math.max(0, window.scrollY) / scale;
-      const visH  = Math.min(canvas.height - visY, window.innerHeight / scale);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, buf);
-      gl.uniform1f(uVisY, visY / canvas.height);
-      gl.uniform1f(uVisH, Math.max(0, visH) / canvas.height);
-      gl.uniform1f(uCaX,  1.0  / canvas.width);
-      gl.uniform1f(uCaY,  1.0  / canvas.height);
-      gl.uniform1f(uBarrel, BARREL);
-      gl.uniform1f(uFx,     fxEnabled ? 1.0 : 0.0);
-      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-    }
-
-    const img = new Image();
-    img.onload = () => {
-      buf.width = canvas.width = img.width;
-      buf.height = canvas.height = img.height;
-      canvas.style.visibility = 'hidden'; // layout placeholder only; WebGL canvas displays content
-
-      bufCtx.drawImage(img, 0, 0);
-      const imageData = bufCtx.getImageData(0, 0, img.width, img.height);
-
-      bufCtx.fillStyle = '#000';
-      bufCtx.fillRect(0, 0, img.width, img.height);
-      bufCtx.font = '16px "IBM VGA 8x16"';
-      bufCtx.textBaseline = 'top';
-
-      const cols = Math.ceil(img.width / CHAR_W);
-      const rows = Math.ceil(img.height / CHAR_H);
-      let cell = 0;
-      const total = cols * rows;
-      const pending = [];
-
-      document.body.style.overflow = 'hidden';
-
-      function scrollToCursor() {
-        const scale = canvas.offsetWidth / canvas.width;
-        const row = Math.floor(cell / cols);
-        const cssY = canvas.offsetTop + row * CHAR_H * scale;
-        window.scrollTo({ top: cssY - window.innerHeight + CHAR_H * scale, behavior: 'instant' });
-      }
-
-      let lastRow = -1;
-      function frame() {
-        for (let i = pending.length - 1; i >= 0; i--) {
-          const p = pending[i];
-          if (--p.frames <= 0) {
-            bufCtx.putImageData(imageData, 0, 0, p.x, p.y, CHAR_W, CHAR_H);
-            pending.splice(i, 1);
-          } else {
-            drawNoise(p.x, p.y);
-          }
-        }
-        for (let i = 0; i < CHARS_PER_FRAME && cell < total; i++, cell++) {
-          const x = (cell % cols) * CHAR_W;
-          const y = Math.floor(cell / cols) * CHAR_H;
-          pending.push({ x, y, frames: NOISE_FRAMES });
-          drawNoise(x, y);
-        }
-
-        const row = Math.floor(cell / cols);
-        if (row !== lastRow) { scrollToCursor(); lastRow = row; }
-        if (cell >= total && pending.length === 0) document.body.style.overflow = '';
-
-        renderGL();
-        requestAnimationFrame(frame);
-      }
-
-      requestAnimationFrame(frame);
-    };
-
-    document.fonts.load('16px "IBM VGA 8x16"').then(() => { img.src = 'teq.png'; });
-  </script>
+  <script src="main.js"></script>
 </body>
 </html>
