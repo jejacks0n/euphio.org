@@ -13,7 +13,7 @@ const AUDIO_FILE = 'thrill.mp3';
 const GLITCH_TRIGGER_TIME = 38;
 const FFT_SIZE = 1024;
 const SMOOTHING = 0.7;
-const MAX_BLOOM_HIT = 8.0;
+const MAX_BLOOM_HIT = 10.0;
 
 // Marquee Constants
 const MARQUEE_TEXT = '  THE · EUPHIO · QUESTION · 2.0  ';
@@ -34,11 +34,13 @@ const THRESHOLD_MIN = 0.65;
 let vizStarted = false;
 let fxEnabled = true;
 let glitchStartTime = -Infinity;
-let analyser, freqData, marqueeX, marqueeLastStep = 0, bloomValue = BLOOM;
+let audioCtx, analyser, freqData, marqueeX, marqueeLastStep = 0, bloomValue = BLOOM;
 
 const audio = new Audio(AUDIO_FILE);
 audio.loop = false;
 audio.preload = 'auto';
+audio.style.display = 'none';
+document.body.appendChild(audio);
 audio.load();
 
 // Offscreen buffer — all content rendered here; WebGL reads it as a texture
@@ -314,29 +316,49 @@ img.onload = () => {
 
 function startViz() {
   vizStarted = true;
-  marqueeX = null; // initialized on first drawViz call
+  marqueeX = null;
+
+  // Full-screen overlay to ensure a clean user gesture for iOS
+  const overlay = document.createElement('div');
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;cursor:pointer;';
+  document.body.appendChild(overlay);
 
   const startAudio = () => {
-    if (!analyser) {
+    // Initialize / Resume AudioContext
+    if (!audioCtx) {
       const AudioContext = window.AudioContext || window.webkitAudioContext;
-      const ctx = new AudioContext();
-      const src = ctx.createMediaElementSource(audio);
-      analyser = ctx.createAnalyser();
+      audioCtx = new AudioContext();
+    }
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+
+    // iOS "Unlock": Play a split-second of silence
+    const buffer = audioCtx.createBuffer(1, 1, 22050);
+    const source = audioCtx.createBufferSource();
+    source.buffer = buffer;
+    source.connect(audioCtx.destination);
+    source.start(0);
+
+    // Setup Analyser if not already done
+    if (!analyser) {
+      const src = audioCtx.createMediaElementSource(audio);
+      analyser = audioCtx.createAnalyser();
       analyser.fftSize = FFT_SIZE;
       analyser.smoothingTimeConstant = SMOOTHING;
       src.connect(analyser);
-      analyser.connect(ctx.destination);
+      analyser.connect(audioCtx.destination);
       freqData = new Uint8Array(analyser.frequencyBinCount);
-      if (ctx.state === 'suspended') ctx.resume();
     }
-    audio.play();
+
+    // Play the actual track
+    audio.play().catch(err => console.warn('Audio play failed:', err));
+
+    // Cleanup
+    if (overlay.parentNode) document.body.removeChild(overlay);
     window.removeEventListener('keydown', startAudio);
-    window.removeEventListener('mousedown', startAudio);
-    window.removeEventListener('touchstart', startAudio);
   };
+
+  overlay.addEventListener('click', startAudio);
   window.addEventListener('keydown', startAudio);
-  window.addEventListener('mousedown', startAudio);
-  window.addEventListener('touchstart', startAudio);
 }
 
 function drawViz(ts) {
