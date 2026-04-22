@@ -1,12 +1,45 @@
 const canvas = document.querySelector('canvas');
 const BARREL = 0.03;
-const BLOOM  = 3.5;
-const GLARE  = 0.45;
-const PHI    = (1 + Math.sqrt(5)) / 2; // golden ratio ≈ 1.618 → 1/PHI ≈ 0.618 → 1 - 1/PHI ≈ 0.382
+const BLOOM = 3.5;
+const GLARE = 0.45;
+const PHI = (1 + Math.sqrt(5)) / 2; // golden ratio ≈ 1.618 → 1/PHI ≈ 0.618 → 1 - 1/PHI ≈ 0.382
 const CHAR_W = 8, CHAR_H = 16;
 const CHARS_PER_SEC = 480; // characters revealed per second during load
-const NOISE_MS      = 32;  // ms each cell shows noise before resolving
+const NOISE_MS = 32;  // ms each cell shows noise before resolving
 const NOISE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ~!@#$%^&*()[]|\\/<>:;{}+=';
+
+// Audio & Glitch Constants
+const AUDIO_FILE = 'thrill.mp3';
+const GLITCH_TRIGGER_TIME = 38;
+const FFT_SIZE = 1024;
+const SMOOTHING = 0.7;
+const MAX_BLOOM_HIT = 8.0;
+
+// Marquee Constants
+const MARQUEE_TEXT = '  THE · EUPHIO · QUESTION · 2.0  ';
+const MARQUEE_COLS = 28; // width in characters
+const MARQUEE_LEFT = 26; // characters from left edge of image
+const MARQUEE_SPEED = 133; // ms per character step
+const MARQUEE_BOTTOM = 16 * 9; // pixels from bottom of image
+const MARQUEE_W = MARQUEE_COLS * CHAR_W;
+const MARQUEE_H = CHAR_H;
+
+// Bloom Sensitivity Constants
+const BLOOM_SUB_RANGE = [2, 6];   // 40-120Hz @ 1024 FFT
+const BLOOM_NOISE_RANGE = [20, 200]; // ~400Hz - 4kHz
+const THRESHOLD_MAX = 0.92;
+const THRESHOLD_MIN = 0.65;
+
+// Global State
+let vizStarted = false;
+let fxEnabled = true;
+let glitchStartTime = -Infinity;
+let analyser, freqData, marqueeX, marqueeLastStep = 0, bloomValue = BLOOM;
+
+const audio = new Audio(AUDIO_FILE);
+audio.loop = false;
+audio.preload = 'auto';
+audio.load();
 
 // Offscreen buffer — all content rendered here; WebGL reads it as a texture
 const buf = document.createElement('canvas');
@@ -41,6 +74,8 @@ const fs = `
   uniform float u_fx;
   uniform float u_bloom;
   uniform float u_time;
+  uniform float u_glitch;
+  uniform float u_glitchSeed;
   varying vec2 v_uv;
 
   vec3 brightPass(vec3 c) {
@@ -70,10 +105,19 @@ const fs = `
 
     vec2 texUV = vec2(warpedUV.x, u_visY + warpedUV.y * u_visH);
 
-    // Chromatic aberration — red/blue channels offset horizontally by one texel
-    float r = texture2D(u_tex, texUV + vec2(-u_caX, 0.0)).r;
+    // Scanline wobble during glitch / degauss
+    texUV.x += (sin(v_uv.y * 43.0 + u_time * 25.0) * 0.018
+               + sin(v_uv.y * 13.0 - u_time * 9.0)  * 0.009) * u_glitch;
+    texUV.x = clamp(texUV.x, 0.0, 1.0);
+
+    // Chromatic aberration — direction rotated per-scanline during glitch for degauss swirl
+    float caAngle = u_glitch * (fract(v_uv.y * 2.0 + u_glitchSeed * 0.03) * 2.0 - 1.0) * 3.14159;
+    vec2 caDir = vec2(cos(caAngle), sin(caAngle));
+    float caScale = 1.0 + u_glitch * 18.0;
+    vec2 caOff = caDir * vec2(u_caX, u_caY) * caScale;
+    float r = texture2D(u_tex, texUV - caOff).r;
     float g = texture2D(u_tex, texUV).g;
-    float b = texture2D(u_tex, texUV + vec2( u_caX, 0.0)).b;
+    float b = texture2D(u_tex, texUV + caOff).b;
     vec3 rgb = vec3(r, g, b);
 
     // Scanlines — darken every other 2px band with a 10fps flicker
@@ -98,6 +142,9 @@ const fs = `
     bloom += brightPass(texture2D(u_tex, texUV + vec2(-3.0, -3.0) * px).rgb) * 0.3;
     bloom /= 22.8;
     rgb = min(vec3(1.0), rgb + bloom * u_bloom);
+
+    // Phosphor excitation flash during glitch
+    rgb = min(vec3(1.0), rgb * (1.0 + u_glitch * 0.5));
 
     // CRT glass reflection — rendered in warped UV space so it follows the curve
     float cx = (warpedUV.x - u_glareX) * 2.0;
@@ -126,7 +173,7 @@ gl.linkProgram(prog);
 gl.useProgram(prog);
 
 gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
-gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
 const aPos = gl.getAttribLocation(prog, 'a_pos');
 gl.enableVertexAttribArray(aPos);
 gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
@@ -139,37 +186,49 @@ gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
 gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
 gl.uniform1i(gl.getUniformLocation(prog, 'u_tex'), 0);
 
-const uVisY   = gl.getUniformLocation(prog, 'u_visY');
-const uVisH   = gl.getUniformLocation(prog, 'u_visH');
-const uCaX    = gl.getUniformLocation(prog, 'u_caX');
-const uCaY    = gl.getUniformLocation(prog, 'u_caY');
+const uVisY = gl.getUniformLocation(prog, 'u_visY');
+const uVisH = gl.getUniformLocation(prog, 'u_visH');
+const uCaX = gl.getUniformLocation(prog, 'u_caX');
+const uCaY = gl.getUniformLocation(prog, 'u_caY');
 const uBarrel = gl.getUniformLocation(prog, 'u_barrel');
-const uGlare  = gl.getUniformLocation(prog, 'u_glare');
+const uGlare = gl.getUniformLocation(prog, 'u_glare');
 const uGlareX = gl.getUniformLocation(prog, 'u_glareX');
-const uFx     = gl.getUniformLocation(prog, 'u_fx');
-const uBloom  = gl.getUniformLocation(prog, 'u_bloom');
-const uTime   = gl.getUniformLocation(prog, 'u_time');
-gl.uniform1f(uGlare,  GLARE);
-gl.uniform1f(uBloom,  BLOOM);
+const uFx = gl.getUniformLocation(prog, 'u_fx');
+const uBloom = gl.getUniformLocation(prog, 'u_bloom');
+const uTime = gl.getUniformLocation(prog, 'u_time');
+const uGlitch = gl.getUniformLocation(prog, 'u_glitch');
+const uGlitchSeed = gl.getUniformLocation(prog, 'u_glitchSeed');
+gl.uniform1f(uGlare, GLARE);
+gl.uniform1f(uBloom, BLOOM);
 gl.uniform1f(uGlareX, 1.0 - 1.0 / PHI); // 1 - 1/φ ≈ 0.382 — left of center
 
-let fxEnabled = true;
-window.addEventListener('keydown', (e) => { if (e.key === '2') fxEnabled = !fxEnabled; });
+window.addEventListener('keydown', (e) => {
+  if (e.key === '2') fxEnabled = !fxEnabled;
+  if (e.key === '3') glitchStartTime = performance.now() / 1000;
+});
 
 function renderGL() {
   if (!buf.width || !buf.height) return;
   const scale = canvas.offsetWidth / canvas.width;
-  const visY  = Math.max(0, window.scrollY) / scale;
-  const visH  = Math.min(canvas.height - visY, window.innerHeight / scale);
+  const visY = Math.max(0, window.scrollY) / scale;
+  const visH = Math.min(canvas.height - visY, window.innerHeight / scale);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, buf);
-  gl.uniform1f(uVisY,   visY / canvas.height);
-  gl.uniform1f(uVisH,   Math.max(0, visH) / canvas.height);
-  gl.uniform1f(uCaX,    1.0 / canvas.width);
-  gl.uniform1f(uCaY,    1.0 / canvas.height);
+  gl.uniform1f(uVisY, visY / canvas.height);
+  gl.uniform1f(uVisH, Math.max(0, visH) / canvas.height);
+  gl.uniform1f(uCaX, 1.0 / canvas.width);
+  gl.uniform1f(uCaY, 1.0 / canvas.height);
   gl.uniform1f(uBarrel, BARREL);
-  gl.uniform1f(uBloom,  bloomValue);
-  gl.uniform1f(uTime,   performance.now() / 1000.0);
-  gl.uniform1f(uFx,     fxEnabled ? 1.0 : 0.0);
+  gl.uniform1f(uBloom, bloomValue);
+  gl.uniform1f(uTime, performance.now() / 1000.0);
+  gl.uniform1f(uFx, fxEnabled ? 1.0 : 0.0);
+
+  // Glitch age: min of manual trigger (system time) and auto-trigger (song time)
+  const manualAge = performance.now() / 1000 - glitchStartTime;
+  const autoAge = audio.currentTime >= GLITCH_TRIGGER_TIME ? audio.currentTime - GLITCH_TRIGGER_TIME : Infinity;
+  const glitchAge = Math.min(manualAge, autoAge);
+
+  gl.uniform1f(uGlitch, Math.max(0, Math.exp(-glitchAge * 2.5)));
+  gl.uniform1f(uGlitchSeed, Math.random() * 100);
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
@@ -211,6 +270,7 @@ img.onload = () => {
   }
 
   let lastRow = -1, lastTs = null;
+
   function frame(ts) {
     if (lastTs === null) lastTs = ts;
     const dt = ts - lastTs;
@@ -235,7 +295,10 @@ img.onload = () => {
     }
 
     const row = Math.floor(cell / cols);
-    if (row !== lastRow) { scrollToCursor(); lastRow = row; }
+    if (row !== lastRow) {
+      scrollToCursor();
+      lastRow = row;
+    }
     if (cell >= total && pending.length === 0 && !vizStarted) {
       document.body.style.overflow = '';
       startViz();
@@ -249,33 +312,31 @@ img.onload = () => {
   requestAnimationFrame(frame);
 };
 
-// Marquee — drawn into buf after loading completes
-const MARQUEE_TEXT   = '  THE · EUPHIO · QUESTION · 2.0  ';
-const MARQUEE_COLS   = 28; // width in characters
-const MARQUEE_LEFT   = 26; // characters from left edge of image
-const MARQUEE_SPEED  = 133; // ms per character step
-const MARQUEE_BOTTOM = 16 * 9; // pixels from bottom of image
-const MARQUEE_W      = MARQUEE_COLS * CHAR_W;
-const MARQUEE_H      = CHAR_H;
-
-let vizStarted = false;
-let analyser, freqData, marqueeX, marqueeLastStep = 0, bloomValue = BLOOM;
-
 function startViz() {
   vizStarted = true;
   marqueeX = null; // initialized on first drawViz call
 
-  // navigator.mediaDevices.getUserMedia({ audio: true, video: false }).then(stream => {
-  //   const ctx = new AudioContext();
-  //   const src = ctx.createMediaStreamSource(stream);
-  //   analyser = ctx.createAnalyser();
-  //   analyser.fftSize = 256;
-  //   analyser.smoothingTimeConstant = 0.8;
-  //   src.connect(analyser);
-  //   freqData = new Uint8Array(analyser.frequencyBinCount);
-  // }).catch(err => {
-  //   console.warn('Mic unavailable:', err);
-  // });
+  const startAudio = () => {
+    if (!analyser) {
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AudioContext();
+      const src = ctx.createMediaElementSource(audio);
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = FFT_SIZE;
+      analyser.smoothingTimeConstant = SMOOTHING;
+      src.connect(analyser);
+      analyser.connect(ctx.destination);
+      freqData = new Uint8Array(analyser.frequencyBinCount);
+      if (ctx.state === 'suspended') ctx.resume();
+    }
+    audio.play();
+    window.removeEventListener('keydown', startAudio);
+    window.removeEventListener('mousedown', startAudio);
+    window.removeEventListener('touchstart', startAudio);
+  };
+  window.addEventListener('keydown', startAudio);
+  window.addEventListener('mousedown', startAudio);
+  window.addEventListener('touchstart', startAudio);
 }
 
 function drawViz(ts) {
@@ -285,7 +346,10 @@ function drawViz(ts) {
   const marqY = buf.height - MARQUEE_H - MARQUEE_BOTTOM;
 
   // Marquee — steps one character width per MARQUEE_SPEED ms for consistent timing
-  if (marqueeX === null) { marqueeX = marqX + MARQUEE_W; marqueeLastStep = ts; }
+  if (marqueeX === null) {
+    marqueeX = marqX + MARQUEE_W;
+    marqueeLastStep = ts;
+  }
   while (ts - marqueeLastStep >= MARQUEE_SPEED) {
     marqueeX -= CHAR_W;
     marqueeLastStep += MARQUEE_SPEED;
@@ -303,13 +367,30 @@ function drawViz(ts) {
   bufCtx.fillText(MARQUEE_TEXT, marqueeX, marqY);
   bufCtx.restore();
 
-  // Bass-driven bloom
+  // Dynamic sub-bass trigger: sensitivity increases with "noise" (mid-high energy)
   if (analyser) {
     analyser.getByteFrequencyData(freqData);
-    let bass = 0;
-    for (let i = 0; i < 4; i++) bass += freqData[i];
-    bass /= 4 * 255;
-    bloomValue = BLOOM + bass * BLOOM * 2.0; // peaks at 3× BLOOM on a hard hit
+
+    // Sub-bass punch
+    let subSum = 0;
+    for (let i = BLOOM_SUB_RANGE[0]; i <= BLOOM_SUB_RANGE[1]; i++) {
+      subSum += freqData[i];
+    }
+    const subBass = subSum / ((BLOOM_SUB_RANGE[1] - BLOOM_SUB_RANGE[0] + 1) * 255);
+
+    // "Noise" level
+    let midSum = 0;
+    for (let i = BLOOM_NOISE_RANGE[0]; i <= BLOOM_NOISE_RANGE[1]; i++) {
+      midSum += freqData[i];
+    }
+    const noise = midSum / ((BLOOM_NOISE_RANGE[1] - BLOOM_NOISE_RANGE[0] + 1) * 255);
+
+    // Dynamic Threshold: Drops during noisy parts to increase sensitivity
+    const threshold = Math.max(THRESHOLD_MIN, THRESHOLD_MAX - noise * 1.0);
+
+    // Hit calculation
+    const hit = Math.pow(Math.max(0, (subBass - threshold) / (1.0 - threshold)), 5.0);
+    bloomValue = BLOOM + hit * MAX_BLOOM_HIT;
   }
 }
 
@@ -320,10 +401,11 @@ document.fonts.load('16px "IBM VGA 8x16"').then(() => {
 
 // Resize handling
 function resizeGL() {
-  glCanvas.width  = window.innerWidth  * devicePixelRatio;
+  glCanvas.width = window.innerWidth * devicePixelRatio;
   glCanvas.height = window.innerHeight * devicePixelRatio;
   gl.viewport(0, 0, glCanvas.width, glCanvas.height);
 }
+
 window.addEventListener('resize', resizeGL);
 resizeGL();
 
